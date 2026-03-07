@@ -1,22 +1,384 @@
-<!doctype html>
-<html lang="ja">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>LED Wiring Tool</title>
-    <style>
-      :root {
-        font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        color: #111827;
-        background: #f8fafc;
-      }
-      * { box-sizing: border-box; }
-      body { margin: 0; }
-      button, input, select { font: inherit; }
-    </style>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
-  </body>
-</html>
+import React, { useMemo, useRef, useState } from 'react';
+import html2canvas from 'html2canvas';
+import { jsPDF } from 'jspdf';
+
+const SAFE_LIMITS = {
+  CB5: { '8': 16, '10': 16, '12': 12 },
+  CB8: { '8': 24, '10': 20, '12': 16 },
+};
+
+const PORT_COLORS = [
+  '#ffb4b4', '#b4dcff', '#c8ffc8', '#ffdc96', '#dcc8ff', '#ffc8c8', '#c8f0f0', '#f0f0a0',
+  '#c8c8ff', '#ffd2aa', '#d2ffd2', '#ffc8e6', '#c8ffff', '#e6d6c8', '#dcdcdc', '#ffe4a3'
+];
+
+const TILE_W_MM = 600;
+const TILE_H_MM = 1200;
+const XD_WIDTH_MM = 482.6;
+const XD_DEPTH_MM = 260;
+const XD_GAP_MM = 200;
+const XD_SET_GAP_PX = 20;
+
+function allocatePorts(controller, bit, cols, rows) {
+  const safeCols = Number.isFinite(Number(cols)) && Number(cols) > 0 ? Math.floor(Number(cols)) : 1;
+  const safeRows = Number.isFinite(Number(rows)) && Number(rows) > 0 ? Math.floor(Number(rows)) : 1;
+  const totalTiles = safeCols * safeRows;
+  const safeLimit = SAFE_LIMITS[controller]?.[bit] ?? safeRows;
+  const candidates = Array.from({ length: safeLimit }, (_, i) => i + 1).filter((n) => n % safeRows === 0);
+  const chunk = candidates.length ? Math.max(...candidates) : safeRows;
+
+  const portSizes = [];
+  let remaining = totalTiles;
+  while (remaining > chunk) {
+    portSizes.push(chunk);
+    remaining -= chunk;
+  }
+  portSizes.push(remaining);
+
+  const labels = portSizes.map((_, i) => {
+    if (i < 10) return { start: `A${i + 1}`, end: `B${i + 1}`, xd: 'A' };
+    const n = i - 9;
+    return { start: `C${n}`, end: `D${n}`, xd: 'C' };
+  });
+
+  return { safeCols, safeRows, totalTiles, safeLimit, chunk, portSizes, labels };
+}
+
+function getPortRanges(portSizes, rows) {
+  let currentCol = 0;
+  return portSizes.map((size) => {
+    const span = Math.max(1, Math.floor(size / rows));
+    const startCol = currentCol;
+    const endCol = currentCol + span - 1;
+    currentCol += span;
+    return { startCol, endCol, span };
+  });
+}
+
+function roundCableLength(m) {
+  if (m <= 5) return 5;
+  if (m <= 10) return 10;
+  if (m <= 20) return 20;
+  return 30;
+}
+
+function buildXdSets(labels) {
+  const needsCD = labels.some((l) => l.xd === 'C');
+  const sets = [{ left: 'XD A', right: 'XD B', key: 'A' }];
+  if (needsCD) sets.push({ left: 'XD C', right: 'XD D', key: 'C' });
+  return sets;
+}
+
+function computeCableSummary(lengths) {
+  const counts = { 5: 0, 10: 0, 20: 0, 30: 0 };
+  lengths.forEach((n) => { counts[n] += 1; });
+  return counts;
+}
+
+function WiringSvg({ controller, bit, cols, rows, xdStartTile }) {
+  const tileW = 82;
+  const tileH = 132;
+  const marginLeft = 70;
+  const marginTop = 150;
+  const marginRight = 280;
+  const marginBottom = 40;
+  const scale = tileW / TILE_W_MM;
+
+  const allocation = useMemo(() => allocatePorts(controller, bit, cols, rows), [controller, bit, cols, rows]);
+  const { safeCols, safeRows, totalTiles, portSizes, labels } = allocation;
+  const ranges = useMemo(() => getPortRanges(portSizes, safeRows), [portSizes, safeRows]);
+  const xdSets = useMemo(() => buildXdSets(labels), [labels]);
+
+  const panelW = safeCols * tileW;
+  const panelH = safeRows * tileH;
+  const width = marginLeft + panelW + marginRight;
+  const height = marginTop + panelH + marginBottom;
+
+  const xdW = XD_WIDTH_MM * scale;
+  const xdH = XD_DEPTH_MM * scale;
+  const xdGap = XD_GAP_MM * scale;
+  const setGap = 36;
+  const setWidth = xdW * 2 + XD_SET_GAP_PX;
+  const xdBaseX = marginLeft + (Math.max(1, Math.floor(Number(xdStartTile) || 1)) - 1) * tileW;
+  const xdY = marginTop - xdGap - xdH;
+
+  const xdAnchors = {
+    A: { x: xdBaseX + xdW / 2, y: xdY + xdH / 2 },
+    B: { x: xdBaseX + xdW + XD_SET_GAP_PX + xdW / 2, y: xdY + xdH / 2 },
+    C: { x: xdBaseX + setWidth + setGap + xdW / 2, y: xdY + xdH / 2 },
+    D: { x: xdBaseX + setWidth + setGap + xdW + XD_SET_GAP_PX + xdW / 2, y: xdY + xdH / 2 },
+  };
+
+  const cableLengths = ranges.map((range, i) => {
+    const portXmm = range.startCol * TILE_W_MM + TILE_W_MM / 2;
+    const portYmm = 120;
+    const xdKey = labels[i].xd;
+    const anchor = xdKey === 'A'
+      ? { x: (Math.max(1, Number(xdStartTile) || 1) - 1) * TILE_W_MM + XD_WIDTH_MM / 2, y: -XD_GAP_MM - XD_DEPTH_MM / 2 }
+      : { x: (Math.max(1, Number(xdStartTile) || 1) - 1) * TILE_W_MM + (XD_WIDTH_MM * 2) + 20 / scale + XD_WIDTH_MM / 2, y: -XD_GAP_MM - XD_DEPTH_MM / 2 };
+    const distM = Math.hypot(portXmm - anchor.x, portYmm - anchor.y) / 1000 + 1;
+    return roundCableLength(distM);
+  });
+
+  const cableSummary = computeCableSummary(cableLengths);
+
+  const cx = (col) => marginLeft + col * tileW + tileW / 2;
+  const cy = (row) => marginTop + row * tileH + tileH / 2;
+  const getEndRow = (span) => (span % 2 === 0 ? 0 : safeRows - 1);
+
+  const portPaths = ranges.map((range, i) => {
+    const points = [];
+    for (let col = range.startCol; col <= range.endCol; col += 1) {
+      const order = col % 2 === 0 ? [...Array(safeRows).keys()] : [...Array(safeRows).keys()].reverse();
+      order.forEach((row) => points.push([cx(col), cy(row)]));
+    }
+    return { ...range, ...labels[i], points, cable: cableLengths[i] };
+  });
+
+  return (
+    <div style={{ overflow: 'auto', border: '1px solid #d1d5db', borderRadius: 20, background: '#fff' }}>
+      <svg xmlns="http://www.w3.org/2000/svg" width={width} height={height} viewBox={`0 0 ${width} ${height}`} style={{ maxWidth: '100%', height: 'auto', display: 'block' }}>
+        <text x={marginLeft} y={42} fontSize="26" fontWeight="700" fill="black">{controller} {bit}bit {safeCols}x{safeRows}</text>
+        <text x={marginLeft} y={72} fontSize="14" fill="black">Total Tiles: {totalTiles}</text>
+
+        {ranges.map((range, i) => (
+          <rect
+            key={`fill-${i}`}
+            x={marginLeft + range.startCol * tileW}
+            y={marginTop}
+            width={(range.endCol - range.startCol + 1) * tileW}
+            height={panelH}
+            fill={PORT_COLORS[i % PORT_COLORS.length]}
+          />
+        ))}
+
+        {portPaths.map((port, i) => (
+          <polyline
+            key={`line-${i}`}
+            fill="none"
+            stroke="black"
+            strokeWidth="6"
+            strokeLinejoin="round"
+            strokeLinecap="round"
+            points={port.points.map((p) => p.join(',')).join(' ')}
+          />
+        ))}
+
+        {Array.from({ length: safeCols + 1 }, (_, c) => (
+          <line
+            key={`v-${c}`}
+            x1={marginLeft + c * tileW}
+            y1={marginTop}
+            x2={marginLeft + c * tileW}
+            y2={marginTop + panelH}
+            stroke="black"
+            strokeWidth={c === 0 || c === safeCols ? 4 : 2}
+          />
+        ))}
+        {Array.from({ length: safeRows + 1 }, (_, r) => (
+          <line
+            key={`h-${r}`}
+            x1={marginLeft}
+            y1={marginTop + r * tileH}
+            x2={marginLeft + panelW}
+            y2={marginTop + r * tileH}
+            stroke="black"
+            strokeWidth={r === 0 || r === safeRows ? 4 : 2}
+          />
+        ))}
+
+        {xdSets.map((set, idx) => {
+          const startX = xdBaseX + idx * (setWidth + setGap);
+          return (
+            <g key={set.key}>
+              <rect x={startX} y={xdY} width={xdW} height={xdH} rx="8" ry="8" fill="#f5f5f5" stroke="black" strokeWidth="3" />
+              <rect x={startX + xdW + XD_SET_GAP_PX} y={xdY} width={xdW} height={xdH} rx="8" ry="8" fill="#f5f5f5" stroke="black" strokeWidth="3" />
+              <text x={startX + xdW / 2} y={xdY + xdH / 2 + 6} textAnchor="middle" fontSize="16" fontWeight="700">{set.left}</text>
+              <text x={startX + xdW + XD_SET_GAP_PX + xdW / 2} y={xdY + xdH / 2 + 6} textAnchor="middle" fontSize="16" fontWeight="700">{set.right}</text>
+            </g>
+          );
+        })}
+
+        {portPaths.map((port, i) => {
+          const endRow = getEndRow(port.span);
+          return (
+            <g key={`labels-${i}`}>
+              <text x={cx(port.startCol)} y={marginTop + 22} textAnchor="middle" fontSize="20" fontWeight="700">{port.start}</text>
+              <text x={cx(port.startCol)} y={marginTop + 42} textAnchor="middle" fontSize="15">{port.cable}m</text>
+              <text
+                x={cx(port.endCol)}
+                y={endRow === safeRows - 1 ? marginTop + panelH - 8 : marginTop + 22}
+                textAnchor="middle"
+                fontSize="20"
+                fontWeight="700"
+              >
+                {port.end}
+              </text>
+            </g>
+          );
+        })}
+
+        <g>
+          <rect x={marginLeft + panelW + 24} y={96} width={220} height={170} fill="white" stroke="black" strokeWidth="3" rx="10" ry="10" />
+          <text x={marginLeft + panelW + 44} y={128} fontSize="24" fontWeight="700">Cable List</text>
+          {([5, 10, 20, 30]).filter((n) => cableSummary[n] > 0).map((n, idx) => (
+            <text key={n} x={marginLeft + panelW + 54} y={168 + idx * 32} fontSize="22">{n} m : {cableSummary[n]}</text>
+          ))}
+        </g>
+      </svg>
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <div style={{ display: 'grid', gap: 8 }}>
+      <label style={{ fontWeight: 600, fontSize: 14 }}>{label}</label>
+      {children}
+    </div>
+  );
+}
+
+function cardStyle() {
+  return {
+    background: 'white',
+    border: '1px solid #e5e7eb',
+    borderRadius: 24,
+    boxShadow: '0 8px 24px rgba(15,23,42,0.06)'
+  };
+}
+
+function inputStyle() {
+  return {
+    width: '100%',
+    padding: '12px 14px',
+    borderRadius: 16,
+    border: '1px solid #d1d5db',
+    background: 'white'
+  };
+}
+
+function buttonStyle(primary = true) {
+  return {
+    padding: '12px 16px',
+    borderRadius: 16,
+    border: primary ? 'none' : '1px solid #d1d5db',
+    background: primary ? '#111827' : 'white',
+    color: primary ? 'white' : '#111827',
+    cursor: 'pointer',
+    fontWeight: 600
+  };
+}
+
+export default function App() {
+  const [controller, setController] = useState('CB5');
+  const [bit, setBit] = useState('10');
+  const [cols, setCols] = useState(18);
+  const [rows, setRows] = useState(6);
+  const [xdStartTile, setXdStartTile] = useState(9);
+  const [error, setError] = useState('');
+  const previewRef = useRef(null);
+
+  const safeCols = Number.isFinite(Number(cols)) && Number(cols) > 0 ? Math.floor(Number(cols)) : 1;
+  const safeRows = Number.isFinite(Number(rows)) && Number(rows) > 0 ? Math.floor(Number(rows)) : 1;
+  const allocation = useMemo(() => allocatePorts(controller, bit, safeCols, safeRows), [controller, bit, safeCols, safeRows]);
+
+  const exportPNG = async () => {
+    try {
+      setError('');
+      if (!previewRef.current) return;
+      const canvas = await html2canvas(previewRef.current, { backgroundColor: '#ffffff', scale: 2 });
+      const url = canvas.toDataURL('image/png');
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${controller}_${bit}bit_${safeCols}x${safeRows}.png`;
+      a.click();
+    } catch {
+      setError('PNG export failed.');
+    }
+  };
+
+  const exportPDF = async () => {
+    try {
+      setError('');
+      if (!previewRef.current) return;
+      const canvas = await html2canvas(previewRef.current, { backgroundColor: '#ffffff', scale: 2 });
+      const imgData = canvas.toDataURL('image/png');
+      const pdf = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a3' });
+      const pageW = pdf.internal.pageSize.getWidth();
+      const pageH = pdf.internal.pageSize.getHeight();
+      const ratio = Math.min(pageW / canvas.width, pageH / canvas.height);
+      const w = canvas.width * ratio;
+      const h = canvas.height * ratio;
+      const x = (pageW - w) / 2;
+      const y = (pageH - h) / 2;
+      pdf.addImage(imgData, 'PNG', x, y, w, h);
+      pdf.save(`${controller}_${bit}bit_${safeCols}x${safeRows}.pdf`);
+    } catch {
+      setError('PDF export failed.');
+    }
+  };
+
+  const resetAll = () => {
+    setController('CB5');
+    setBit('10');
+    setCols(18);
+    setRows(6);
+    setXdStartTile(9);
+    setError('');
+  };
+
+  return (
+    <div style={{ minHeight: '100vh', background: '#f8fafc', padding: 16 }}>
+      <div style={{ maxWidth: 1440, margin: '0 auto', display: 'grid', gap: 16, gridTemplateColumns: 'minmax(300px, 360px) 1fr' }}>
+        <section style={{ ...cardStyle(), padding: 20 }}>
+          <h1 style={{ margin: '0 0 16px', fontSize: 22 }}>LED Wiring Tool</h1>
+          {error && <div style={{ marginBottom: 12, border: '1px solid #fecaca', background: '#fef2f2', color: '#b91c1c', padding: '10px 12px', borderRadius: 14 }}>{error}</div>}
+          <div style={{ display: 'grid', gap: 14 }}>
+            <Field label="Controller">
+              <select value={controller} onChange={(e) => setController(e.target.value)} style={inputStyle()}>
+                <option value="CB5">CB5</option>
+                <option value="CB8">CB8</option>
+              </select>
+            </Field>
+            <Field label="Bit">
+              <select value={bit} onChange={(e) => setBit(e.target.value)} style={inputStyle()}>
+                <option value="8">8bit</option>
+                <option value="10">10bit</option>
+                <option value="12">12bit</option>
+              </select>
+            </Field>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+              <Field label="Width">
+                <input type="number" min="1" value={cols} onChange={(e) => setCols(e.target.value === '' ? '' : Number(e.target.value))} style={inputStyle()} />
+              </Field>
+              <Field label="Height">
+                <input type="number" min="1" value={rows} onChange={(e) => setRows(e.target.value === '' ? '' : Number(e.target.value))} style={inputStyle()} />
+              </Field>
+            </div>
+            <Field label="XD Position (from left)">
+              <input type="number" min="1" value={xdStartTile} onChange={(e) => setXdStartTile(e.target.value === '' ? '' : Number(e.target.value))} style={inputStyle()} />
+            </Field>
+            <div style={{ border: '1px solid #e5e7eb', borderRadius: 16, padding: 14, background: 'white', fontSize: 14, lineHeight: 1.7 }}>
+              <div><strong>Total Tiles:</strong> {allocation.totalTiles}</div>
+              <div><strong>Safe Limit:</strong> {allocation.safeLimit}</div>
+              <div><strong>Allocation:</strong> {allocation.labels.map((l, i) => `${l.start}=${allocation.portSizes[i]}`).join(' / ')}</div>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+              <button onClick={exportPNG} style={buttonStyle(true)}>Export PNG</button>
+              <button onClick={exportPDF} style={buttonStyle(true)}>Export PDF</button>
+            </div>
+            <button onClick={resetAll} style={buttonStyle(false)}>Reset</button>
+          </div>
+        </section>
+
+        <section style={{ ...cardStyle(), padding: 20 }}>
+          <h2 style={{ margin: '0 0 16px', fontSize: 22 }}>Preview</h2>
+          <div ref={previewRef} style={{ background: 'white', borderRadius: 18, padding: 12 }}>
+            <WiringSvg controller={controller} bit={bit} cols={safeCols} rows={safeRows} xdStartTile={xdStartTile} />
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
