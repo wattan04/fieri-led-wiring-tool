@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1.0" />
+<title>FIERI PSL ROE Vol.5</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<style>
+:root{--bg:#f3f4f6;--card:#ffffff;--border:#d1d5db;--text:#111827}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text)}
+#ui{max-width:1100px;margin:0 auto;padding:16px}
+.panel{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px}
+label{display:block;margin-top:10px;font-weight:700;font-size:14px}
+input,select,button{width:100%;padding:10px;margin-top:6px;border-radius:8px;border:1px solid #cbd5e1;font-size:16px;background:#fff}
+button{cursor:pointer;font-weight:700}
+.controls{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.note{margin-top:8px;font-size:13px;line-height:1.6;color:#4b5563}
+.error{display:none;margin-top:12px;border:1px solid #fecaca;background:#fef2f2;color:#b91c1c;border-radius:12px;padding:10px 12px;font-size:14px;white-space:pre-wrap}
+#previewWrap{display:none;position:fixed;inset:0;background:#111;overflow:auto;z-index:999}
+.toolbar{position:fixed;right:20px;top:20px;z-index:20;display:flex;gap:8px;flex-wrap:wrap}
+.toolbar button{width:auto;padding:10px 16px}
+#page{background:#fff;width:297mm;height:210mm;margin:40px auto;position:relative;box-shadow:0 20px 60px rgba(0,0,0,.5);overflow:hidden}
+#pageInner{position:absolute;inset:0;padding:4mm}
+#svgHolder{width:100%;height:100%;display:flex;align-items:center;justify-content:center;overflow:auto}
+#svgFrame{width:100%;height:100%;display:flex;align-items:center;justify-content:center;transform-origin:center center}
+@media (max-width:680px){.controls{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div id="ui"><div class="panel">
+<label>Controller</label>
+<select id="controller"><option value="CB5">CB5</option><option value="CB8">CB8</option><option value="V8">V8</option></select>
+<label>Bit</label>
+<select id="bit"><option value="8">8bit</option><option value="10" selected>10bit</option><option value="12">12bit</option></select>
+<label>Wiring Mode</label>
+<select id="mode"><option value="top">Top In</option><option value="bottom">Bottom In</option></select>
+<label>Width</label><input id="cols" type="number" min="1" />
+<label>Height</label><input id="rowsInput" type="text" inputmode="decimal" placeholder="例: 5 または 5.5" />
+<label>XD Position (SLから数える)</label><input id="xdpos" type="number" min="1" />
+<div class="controls"><button id="previewBtn" onclick="previewDiagram()" style="display:none;">Preview</button><button onclick="resetForm()">Reset</button></div>
+<div class="controls"><button id="pdfBtn" onclick="exportPDF()" style="display:none;">Export PDF</button><div></div></div>
+<div class="note">Vol.5 / FRONT VIEW / 左=下手(SL) 右=上手(SR) / Height は整数または .5 のみ / A4横固定 / PDFのみ</div>
+<div class="error" id="errorBox"></div>
+</div></div>
+
+<div id="previewWrap">
+  <div class="toolbar">
+    <button onclick="zoomOut()">－</button><button onclick="zoomIn()">＋</button><button onclick="resetZoom()">100%</button><button onclick="closePreview()">CLOSE</button>
+  </div>
+  <div id="page"><div id="pageInner"><div id="svgHolder"><div id="svgFrame"></div></div></div></div>
+</div>
+
+<script>
+const MAX_TILES={CB5:{8:24,10:19,12:16},CB8:{8:50,10:40,12:33},V8:{8:50,10:40,12:33}};
+const TILE_MM={CB5:{w:600,h:1200,halfH:600},CB8:{w:600,h:1200,halfH:600},V8:{w:1000,h:1000,halfH:500}};
+const PORT_COLORS=['#ffb4b4','#b4dcff','#c8ffc8','#ffdc96','#dcc8ff','#ffc8c8','#c8f0f0','#f0f0a0','#c8c8ff','#ffd2aa','#d2ffd2','#ffc8e6','#c8ffff'];
+let currentZoom=1, renderCacheKey="", renderCacheSvg="";
+const el=id=>document.getElementById(id);
+const clamp=(v,min,max)=>Math.max(min,Math.min(max,v));
+const isEven=n=>n%2===0;
+
+function showError(msg){const box=el("errorBox"); if(!msg){box.style.display="none";box.textContent="";return;} box.style.display="block"; box.textContent=msg;}
+function parseHeightInput(raw){const text=String(raw||"").trim(); if(!text) return null; if(!/^\d+(\.5)?$/.test(text)) return {error:"Height must be integer or .5"}; const val=Number(text); if(!Number.isFinite(val)||val<=0) return {error:"Height must be greater than 0"}; const rows=Math.floor(val); const halfRow=Math.abs(val-rows-0.5)<1e-9; return {rows,halfRow,display:text};}
+function updateButtons(){const cols=el("cols").value.trim(), rows=el("rowsInput").value.trim(), xd=el("xdpos").value.trim(); const ready=cols!==""&&rows!==""&&xd!==""&&Number(cols)>0&&Number(xd)>0; el("previewBtn").style.display=ready?"block":"none"; el("pdfBtn").style.display=ready?"block":"none";}
+["cols","rowsInput","xdpos","controller","bit","mode"].forEach(id=>{el(id).addEventListener("input",()=>{renderCacheKey="";renderCacheSvg="";updateButtons();showError("");});el(id).addEventListener("change",()=>{renderCacheKey="";renderCacheSvg="";updateButtons();showError("");});}); updateButtons();
+function resetForm(){el("controller").value="CB5";el("bit").value="10";el("mode").value="top";el("cols").value="";el("rowsInput").value="";el("xdpos").value="";renderCacheKey="";renderCacheSvg="";showError("");updateButtons();}
+function buildInputModel(){const h=parseHeightInput(el("rowsInput").value); if(!h) throw new Error("Height is required"); if(h.error) throw new Error(h.error); const controller=el("controller").value, bit=Number(el("bit").value), cols=clamp(Math.max(1,Math.floor(Number(el("cols").value||1))),1,200), rows=clamp(h.rows,1,200), xdPos=clamp(Math.max(1,Math.floor(Number(el("xdpos").value||1))),1,cols), mode=el("mode").value, halfRow=h.halfRow; return {controller,bit,cols,rows,xdPos,mode,halfRow,heightDisplay:h.display};}
+function sameSideB(mode,span){return isEven(span);}
+function makeLabels(count){const arr=[]; for(let i=0;i<count;i++){if(i<10) arr.push({start:`A${i+1}`,end:`B${i+1}`,group:"AB"}); else arr.push({start:`C${i-9}`,end:`D${i-9}`,group:"CD"});} return arr;}
+function allocatePorts(model){
+  const {controller, bit, cols, rows, mode, halfRow} = model;
+  const maxTiles = MAX_TILES[controller][bit];
+  const panelsPerColumn = rows + (halfRow ? 1 : 0);
+  const maxCols = Math.max(1, Math.floor(maxTiles / panelsPerColumn));
+
+  function makeLabels(count){
+    const arr=[];
+    for(let i=0;i<count;i++){
+      if(i < 10) arr.push({start:`A${i+1}`, end:`B${i+1}`, group:"AB"});
+      else arr.push({start:`C${i-9}`, end:`D${i-9}`, group:"CD"});
+    }
+    return arr;
+  }
+
+  // 2-port special rule
+  if(cols <= maxCols * 2){
+    const left = Math.floor(cols / 2);
+    const right = cols - left;
+    const leftOk = left > 0 && left * panelsPerColumn <= maxTiles;
+    const rightOk = right > 0 && right * panelsPerColumn <= maxTiles;
+    if(leftOk && rightOk && sameSideB(mode, left) && sameSideB(mode, right)){
+      const parts=[left,right];
+      return {maxTiles,maxColsPerPort:maxCols,panelsPerColumn,parts,sizes:parts.map(c=>c*panelsPerColumn),labels:makeLabels(parts.length)};
+    }
+  }
+
+  let remain = cols;
+  const parts = [];
+  while(remain > 0){
+    const take = Math.min(maxCols, remain);
+    parts.push(take);
+    remain -= take;
+  }
+
+  return {maxTiles,maxColsPerPort:maxCols,panelsPerColumn,parts,sizes:parts.map(c=>c*panelsPerColumn),labels:makeLabels(parts.length)};
+}
+
+function capacityErrors(model, alloc){const max=MAX_TILES[model.controller][model.bit], errs=[]; alloc.sizes.forEach((panels,i)=>{if(panels>max) errs.push(`${alloc.labels[i].start} = ${panels} panels (Max ${max})`);}); return errs;}
+function makeRanges(parts){let currentCol=0; return parts.map(span=>{const out={startCol:currentCol,endCol:currentCol+span-1,span}; currentCol+=span; return out;});}
+function effectiveRows(rows, halfRow){return rows+(halfRow?1:0);}
+function endDisplayRowForSpan(span, fullRows, mode, halfRow){const totalRows=effectiveRows(fullRows,halfRow); if(mode==="top") return isEven(span)?0:totalRows-1; return isEven(span)?totalRows-1:0;}
+function roundCableLength(m){if(m<=5)return 5; if(m<=10)return 10; if(m<=20)return 20; return 30;}
+function getSetLayout(startRows,endRows){const allOpposite=endRows.length>0&&endRows.every((row,i)=>row!==startRows[i]); return allOpposite?"vertical":"horizontal";}
+function buildRenderModel(){
+  const input = buildInputModel();
+  const tileMM = TILE_MM[input.controller];
+  const alloc = allocatePorts(input);
+  const capErrors = capacityErrors(input, alloc);
+  if(capErrors.length) throw new Error("Port capacity exceeded\n\n" + capErrors.join("\n"));
+
+  const ranges = makeRanges(alloc.parts);
+  const totalDisplayRows = effectiveRows(input.rows, input.halfRow);
+  const startRow = input.mode === "top" ? 0 : totalDisplayRows - 1;
+
+  const abStart=[], abEnd=[], cdStart=[], cdEnd=[];
+  ranges.forEach((r,i)=>{
+    const endRow = endDisplayRowForSpan(r.span, input.rows, input.mode, input.halfRow);
+    if(alloc.labels[i].group === "AB"){ abStart.push(startRow); abEnd.push(endRow); }
+    else { cdStart.push(startRow); cdEnd.push(endRow); }
+  });
+
+  const displayRows = input.rows + (input.halfRow ? 1 : 0);
+
+  return {
+    ...input,
+    tileMM,
+    alloc,
+    ranges,
+    totalDisplayRows,
+    startRow,
+    abLayout:getSetLayout(abStart, abEnd),
+    hasCD:alloc.labels.some(l => l.group === "CD"),
+    cdLayout:cdStart.length ? getSetLayout(cdStart, cdEnd) : "horizontal",
+    hardware:{
+      twoWay:Math.floor(input.cols / 2),
+      oneWay:input.cols % 2,
+      fourLock:(input.cols - 1) * displayRows,
+      twoLock:input.cols + (2 * displayRows) - 1
+    }
+  };
+}
+
+function getRowHeightMM(model, idx){if(model.halfRow&&idx===model.totalDisplayRows-1) return model.tileMM.halfH; return model.tileMM.h;}
+function getRowTopMM(model, idx){let y=0; for(let i=0;i<idx;i++) y+=getRowHeightMM(model,i); return y;}
+function getRowCenterMM(model, idx){return getRowTopMM(model,idx)+getRowHeightMM(model,idx)/2;}
+function buildSvgText(){
+  const model=buildRenderModel();
+  const cacheKey=JSON.stringify(model);
+  if(cacheKey===renderCacheKey&&renderCacheSvg) return renderCacheSvg;
+  const svgW=1200, svgH=820, titleSize=32, headingSize=22, infoSize=16, listBodySize=16, listLineH=20;
+  const titleX=20, titleY=36, frontY=64, infoY1=92, infoY2=112, infoY3=132, infoY4=152, cableX=900, partsX=1050, listTop=36;
+  const leftArea=24, topArea=176, rightArea=20, bottomArea=24, totalAvailW=svgW-leftArea-rightArea, totalAvailH=svgH-topArea-bottomArea, reservedRight=280, diagramAvailW=totalAvailW-reservedRight, diagramAvailH=totalAvailH;
+  const wallUnitsW=model.cols, wallUnitsH=model.rows*(model.tileMM.h/model.tileMM.w)+(model.halfRow?(model.tileMM.halfH/model.tileMM.w):0);
+  const xdWUnits=1.2, xdHUnits=0.6, xdGapUnits=0.35, pairGapUnits=0.28, setGapUnits=0.55, topNeed=xdHUnits+xdGapUnits, bottomNeed=xdHUnits+xdGapUnits;
+  const rightNeed=model.hasCD?(xdWUnits*4+pairGapUnits*2+setGapUnits):(xdWUnits*2+pairGapUnits);
+  const totalUnitsW=Math.max(wallUnitsW,rightNeed), totalUnitsH=wallUnitsH+topNeed+bottomNeed;
+  const unit=Math.min(diagramAvailW/totalUnitsW,diagramAvailH/totalUnitsH);
+  const tileW=unit, fullTileH=unit*(model.tileMM.h/model.tileMM.w), halfTileH=unit*(model.tileMM.halfH/model.tileMM.w);
+  const portFont=Math.max(9,tileW*0.45), meterFont=Math.max(6,tileW*0.22), wireStroke=Math.max(1.0,tileW*0.06), gridStroke=Math.max(0.7,tileW*0.025), outerStroke=Math.max(1.3,tileW*0.05), xdW=tileW*1.2, xdH=tileW*0.6, xdGap=tileW*0.35, pairGap=tileW*0.28, setGap=tileW*0.55;
+  const wallW=model.cols*tileW, wallH=model.rows*fullTileH+(model.halfRow?halfTileH:0), contentW=Math.max(wallW,model.hasCD?(xdW*4+pairGap*2+setGap):(xdW*2+pairGap)), contentH=wallH+xdH+xdGap+xdH+xdGap;
+  const contentX=leftArea+(diagramAvailW-contentW)/2, contentY=topArea+(diagramAvailH-contentH)/2, panelX=contentX, panelY=contentY+xdH+xdGap;
+  function rowTopPx(idx){let y=panelY; for(let i=0;i<idx;i++) y+=(model.halfRow&&i===model.totalDisplayRows-1)?halfTileH:fullTileH; return y;}
+  function rowHeightPx(idx){return (model.halfRow&&idx===model.totalDisplayRows-1)?halfTileH:fullTileH;}
+  function rowCenterPx(idx){return rowTopPx(idx)+rowHeightPx(idx)/2;}
+  const xdaCenter=panelX+(model.xdPos-1)*tileW+tileW/2, xdaX=xdaCenter-xdW/2, xdaY=model.mode==="top"?panelY-xdGap-xdH:panelY+wallH+xdGap;
+  const xdbX = model.abLayout === "vertical" ? xdaX : xdaX + xdW + pairGap;
+  const xdbY = model.abLayout === "vertical" ? (model.mode === "top" ? panelY + wallH + xdGap : panelY - xdGap - xdH) : xdaY;
+  const xdcX = (model.abLayout === "vertical" ? xdaX : xdbX) + xdW + setGap;
+  const xdcY = xdaY;
+  const xddX = model.cdLayout === "vertical" ? xdcX : xdcX + xdW + pairGap;
+  const xddY = model.cdLayout === "vertical" ? (model.mode === "top" ? panelY + wallH + xdGap : panelY - xdGap - xdH) : xdcY;
+  const xdBoxes=[{key:"A",label:"XD A",x:xdaX,y:xdaY,side:(xdaY<panelY?"top":"bottom")},{key:"B",label:"XD B",x:xdbX,y:xdbY,side:(xdbY<panelY?"top":"bottom")}];
+  if(model.hasCD){xdBoxes.push({key:"C",label:"XD C",x:xdcX,y:xdcY,side:(xdcY<panelY?"top":"bottom")},{key:"D",label:"XD D",x:xddX,y:xddY,side:(xddY<panelY?"top":"bottom")});}
+  const xdMap=Object.fromEntries(xdBoxes.map(b=>[b.key,b]));
+  const aLens=[], bLens=[], cableCounts={5:0,10:0,20:0,30:0}; let jjCount=0, bridgeCount=0;
+  const realWallHeightMM=model.rows*model.tileMM.h+(model.halfRow?model.tileMM.halfH:0);
+  model.ranges.forEach((r,i)=>{const label=model.alloc.labels[i], endRow=endDisplayRowForSpan(r.span,model.rows,model.mode,model.halfRow), startXMM=r.startCol*model.tileMM.w+model.tileMM.w/2, endXMM=r.endCol*model.tileMM.w+model.tileMM.w/2, startYMM=getRowCenterMM(model,model.startRow), endYMM=getRowCenterMM(model,endRow), startXd=label.group==="AB"?xdMap.A:xdMap.C, endXd=label.group==="AB"?xdMap.B:xdMap.D, startXdCenterXMM=(startXd.x+xdW/2-panelX)/tileW*model.tileMM.w, startXdCenterYMM=(startXd.y+xdH/2-panelY)/fullTileH*model.tileMM.h, endXdCenterXMM=(endXd.x+xdW/2-panelX)/tileW*model.tileMM.w, endXdCenterYMM=(endXd.y+xdH/2-panelY)/fullTileH*model.tileMM.h;
+    let aDistMM=Math.hypot(startXMM-startXdCenterXMM,startYMM-startXdCenterYMM), bDistMM=Math.hypot(endXMM-endXdCenterXMM,endYMM-endXdCenterYMM);
+    const startPortSide=model.startRow===0?"top":"bottom", endPortSide=endRow===0?"top":"bottom";
+    if(startXd.side!==startPortSide) aDistMM+=realWallHeightMM;
+    if(endXd.side!==endPortSide) bDistMM+=realWallHeightMM;
+    const aRounded=roundCableLength(aDistMM/1000+1), bRounded=roundCableLength(bDistMM/1000+1); aLens.push(aRounded); bLens.push(bRounded); cableCounts[aRounded]+=1; cableCounts[bRounded]+=1;
+    for(let rel=0; rel<r.span-1; rel++){const transitionAtBottom=model.mode==="top"?(rel%2===0):(rel%2!==0); if(transitionAtBottom) bridgeCount+=1; else jjCount+=1;}
+    if(model.mode==="top"){jjCount+=1; if(endRow===0) jjCount+=1;}
+  });
+  const cableLines=[]; if(cableCounts[5]) cableLines.push(`5m : ${cableCounts[5]}`); if(cableCounts[10]) cableLines.push(`10m : ${cableCounts[10]}`); if(cableCounts[20]) cableLines.push(`20m : ${cableCounts[20]}`); if(cableCounts[30]) cableLines.push(`30m : ${cableCounts[30]}`); if(jjCount) cableLines.push(`JJ : ${jjCount}`); if(bridgeCount) cableLines.push(`Bridge Cable : ${bridgeCount}`);
+  const partsLines=[`2way Hanger : ${model.hardware.twoWay}`,`1way Hanger : ${model.hardware.oneWay}`,`4Lock : ${model.hardware.fourLock}`,`2Lock : ${model.hardware.twoLock}`];
+  const out=[]; out.push(`<svg viewBox="0 0 ${svgW} ${svgH}" xmlns="http://www.w3.org/2000/svg">`); out.push(`<rect width="100%" height="100%" fill="white"/>`);
+  out.push(`<text x="${titleX}" y="${titleY}" font-size="${titleSize}" font-weight="700">FIERI PSL ROE Vol.5</text>`);
+  out.push(`<text x="${titleX}" y="${frontY}" font-size="${headingSize}" font-weight="700">FRONT VIEW</text>`);
+  out.push(`<text x="${titleX}" y="${infoY1}" font-size="${infoSize}">${model.controller} ${model.bit}bit ${model.heightDisplay}H × ${model.cols}W / ${model.mode==="top"?"Top In":"Bottom In"}</text>`);
+  out.push(`<text x="${titleX}" y="${infoY2}" font-size="${infoSize}">Wall Size ${model.cols*model.tileMM.w} × ${realWallHeightMM} mm / ${(model.cols*model.tileMM.w/1000).toFixed(1)} × ${(realWallHeightMM/1000).toFixed(1)} m</text>`);
+  out.push(`<text x="${titleX}" y="${infoY3}" font-size="${infoSize}">Total Panels ${(model.cols*model.rows)+(model.halfRow?model.cols:0)}</text>`);
+  out.push(`<text x="${titleX}" y="${infoY4}" font-size="${infoSize}">Allocation: ${model.alloc.labels.map((l,i)=>`${l.start}=${model.alloc.sizes[i]}`).join(" / ")}</text>`);
+  out.push(`<text x="${cableX}" y="${listTop}" font-size="${headingSize}" font-weight="700">Cable List</text>`);
+  cableLines.forEach((line,idx)=>out.push(`<text x="${cableX}" y="${listTop+22+idx*listLineH}" font-size="${listBodySize}">${line}</text>`));
+  out.push(`<text x="${partsX}" y="${listTop}" font-size="${headingSize}" font-weight="700">Parts List</text>`);
+  partsLines.forEach((line,idx)=>out.push(`<text x="${partsX}" y="${listTop+22+idx*listLineH}" font-size="${listBodySize}">${line}</text>`));
+  model.ranges.forEach((r,i)=>{const x=panelX+r.startCol*tileW, w=(r.endCol-r.startCol+1)*tileW; out.push(`<rect x="${x}" y="${panelY}" width="${w}" height="${wallH}" fill="${PORT_COLORS[i%PORT_COLORS.length]}"/>`);});
+  for(let c=0;c<=model.cols;c++){const x=panelX+c*tileW; out.push(`<line x1="${x}" y1="${panelY}" x2="${x}" y2="${panelY+wallH}" stroke="black" stroke-width="${c===0||c===model.cols?outerStroke:gridStroke}"/>`);}
+  let currentY=panelY; out.push(`<line x1="${panelX}" y1="${currentY}" x2="${panelX+wallW}" y2="${currentY}" stroke="black" stroke-width="${outerStroke}"/>`);
+  for(let r=0;r<model.rows;r++){currentY+=fullTileH; const strokeW=(!model.halfRow&&r===model.rows-1)?outerStroke:gridStroke; out.push(`<line x1="${panelX}" y1="${currentY}" x2="${panelX+wallW}" y2="${currentY}" stroke="black" stroke-width="${strokeW}"/>`);}
+  if(model.halfRow){currentY+=halfTileH; out.push(`<line x1="${panelX}" y1="${currentY}" x2="${panelX+wallW}" y2="${currentY}" stroke="black" stroke-width="${outerStroke}"/>`);}
+  xdBoxes.forEach(box=>{out.push(`<rect x="${box.x}" y="${box.y}" width="${xdW}" height="${xdH}" fill="#f5f5f5" stroke="black" stroke-width="${Math.max(1,gridStroke)}"/>`); out.push(`<text x="${box.x+xdW/2}" y="${box.y+xdH/2+3}" text-anchor="middle" font-size="${Math.max(7,tileW*0.18)}" font-weight="700">${box.label}</text>`);});
+  model.ranges.forEach((r,i)=>{const label=model.alloc.labels[i], endRow=endDisplayRowForSpan(r.span,model.rows,model.mode,model.halfRow), startCX=panelX+r.startCol*tileW+tileW/2, startCY=rowCenterPx(model.startRow), endCX=panelX+r.endCol*tileW+tileW/2, endCY=rowCenterPx(endRow), startOffset=rowHeightPx(model.startRow)*0.2, endOffset=rowHeightPx(endRow)*0.2, startY=model.startRow===0?startCY+startOffset:startCY-startOffset, endY=endRow===0?endCY+endOffset:endCY-endOffset;
+    const startLabelY=model.startRow===0?rowTopPx(model.startRow)+Math.max(12,rowHeightPx(model.startRow)*0.34):rowTopPx(model.startRow)+rowHeightPx(model.startRow)-Math.max(4,rowHeightPx(model.startRow)*0.10), startMeterY=model.startRow===0?startLabelY+Math.max(10,rowHeightPx(model.startRow)*0.20):startLabelY-Math.max(10,rowHeightPx(model.startRow)*0.20), endLabelY=endRow===0?rowTopPx(endRow)+Math.max(12,rowHeightPx(endRow)*0.34):rowTopPx(endRow)+rowHeightPx(endRow)-Math.max(4,rowHeightPx(endRow)*0.10), endMeterY=endRow===0?endLabelY+Math.max(10,rowHeightPx(endRow)*0.20):endLabelY-Math.max(10,rowHeightPx(endRow)*0.20);
+    out.push(`<text x="${startCX}" y="${startLabelY}" text-anchor="middle" font-size="${portFont}" font-weight="700">${label.start}</text>`);
+    out.push(`<text x="${startCX}" y="${startMeterY}" text-anchor="middle" font-size="${meterFont}">${aLens[i]}m</text>`);
+    out.push(`<text x="${endCX}" y="${endLabelY}" text-anchor="middle" font-size="${portFont}" font-weight="700">${label.end}</text>`);
+    out.push(`<text x="${endCX}" y="${endMeterY}" text-anchor="middle" font-size="${meterFont}">${bLens[i]}m</text>`);
+    const pts=[]; pts.push(`${startCX},${startY}`);
+    for(let col=r.startCol; col<=r.endCol; col++){
+      const rel=col-r.startCol;
+      let order;
+      if(model.mode==="top") order=rel%2===0?[...Array(model.totalDisplayRows).keys()]:[...Array(model.totalDisplayRows).keys()].reverse();
+      else order=rel%2===0?[...Array(model.totalDisplayRows).keys()].reverse():[...Array(model.totalDisplayRows).keys()];
+      order.forEach((row,idx)=>{const x=panelX+col*tileW+tileW/2; let y=rowCenterPx(row); if(col===r.startCol&&idx===0) y=startY; if(col===r.endCol&&idx===order.length-1) y=endY; pts.push(`${x},${y}`);});
+    }
+    out.push(`<polyline fill="none" stroke="black" stroke-width="${wireStroke}" stroke-linecap="butt" stroke-linejoin="round" points="${pts.join(" ")}"/>`);
+  });
+  out.push(`</svg>`);
+  const svgText=out.join(""); renderCacheKey=cacheKey; renderCacheSvg=svgText; return svgText;
+}
+function fitSvgToPage(){const svg=document.querySelector("#svgFrame svg"), holder=document.getElementById("svgHolder"); if(!svg||!holder) return; const vb=svg.viewBox.baseVal; const baseScale=Math.min(holder.clientWidth/vb.width,holder.clientHeight/vb.height); svg.style.width=(vb.width*baseScale)+"px"; svg.style.height=(vb.height*baseScale)+"px"; svg.style.maxWidth="none"; svg.style.maxHeight="none"; svg.style.display="block"; applyZoom();}
+function applyZoom(){el("svgFrame").style.transform=`scale(${currentZoom})`;}
+function zoomIn(){currentZoom+=0.1; applyZoom();}
+function zoomOut(){currentZoom=Math.max(0.2,currentZoom-0.1); applyZoom();}
+function resetZoom(){currentZoom=1; applyZoom();}
+function previewDiagram(){try{showError(""); el("previewWrap").style.display="block"; el("svgFrame").innerHTML=buildSvgText(); currentZoom=1; requestAnimationFrame(fitSvgToPage);}catch(err){console.error(err); showError(err.message||"プレビューの生成に失敗しました。"); el("previewWrap").style.display="none";}}
+function closePreview(){el("previewWrap").style.display="none";}
+window.addEventListener("resize",()=>{if(el("previewWrap").style.display==="block") fitSvgToPage();});
+async function exportPDF(){try{const temp=document.createElement("div"); temp.style.position="fixed"; temp.style.left="-99999px"; temp.style.top="-99999px"; temp.innerHTML=buildSvgText(); document.body.appendChild(temp); const svg=temp.querySelector("svg"); const xml=new XMLSerializer().serializeToString(svg); const blob=new Blob([xml],{type:"image/svg+xml"}); const url=URL.createObjectURL(blob); const img=new Image(); await new Promise((resolve,reject)=>{img.onload=resolve; img.onerror=reject; img.src=url;}); const canvas=document.createElement("canvas"); canvas.width=2339; canvas.height=1654; const ctx=canvas.getContext("2d"); ctx.fillStyle="white"; ctx.fillRect(0,0,canvas.width,canvas.height); const pad=8; const scale=Math.min((canvas.width-pad*2)/img.width,(canvas.height-pad*2)/img.height); const drawW=img.width*scale, drawH=img.height*scale, dx=(canvas.width-drawW)/2, dy=(canvas.height-drawH)/2; ctx.drawImage(img,dx,dy,drawW,drawH); const data=canvas.toDataURL("image/png"); const {jsPDF}=window.jspdf; const pdf=new jsPDF({orientation:"landscape",unit:"mm",format:"a4"}); pdf.addImage(data,"PNG",0,0,297,210); pdf.save("fieri_psl_roe_vol5.pdf"); URL.revokeObjectURL(url); temp.remove();}catch(err){console.error(err); showError(err.message||"PDF出力に失敗しました。");}}
+</script>
+</body>
+</html>
